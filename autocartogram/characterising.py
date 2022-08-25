@@ -1,9 +1,71 @@
 import geopandas as gpd
+import copy
 import pandas as pd
 import numpy as np
 from scipy.stats import rankdata
-import copy
+from shapely.geometry import MultiLineString
 
+
+class Input_File:
+    
+    def __init__(
+        self,
+        geodataframe,
+        id_header,
+        name_header
+    ):
+        
+        assert isinstance(geodataframe, gpd.GeoDataFrame), "Input must be a GeoDataFrame"
+        assert (id_header != "__dummy__") & (name_header != "__dummy__"), "Sorry, '__dummy__' is a reserved column... please rename!"
+        assert (id_header != "__centroid__") & (name_header != "__centroid__"), "Sorry, '__centroid__' is a reserved column... please rename!"
+        
+        self.id_header = id_header
+        self.name_header = name_header
+        
+        self.geodata = _homogenise_gdf_(geodataframe, id_header, name_header)
+        self.geo_list = self.geodata[id_header].values
+        self.name_list = self.geodata[name_header].values
+        self.number_of_geographies = len(geodataframe)
+        
+        self.lookups = _Index_Id_Name_Transformer_(self.geo_list, self.name_list)
+                
+        self.coastline = MultiLineString([x.exterior for x in geodataframe.dissolve()['geometry'].values[0].geoms])
+        
+        
+    def neighbours_array(self, use_fractional_borders=True):        
+        
+        # We only need to run the whole process if it hasn't been done before, or if the use_fractional_borders has changed
+        if '_neighbours_array_' in dir(self):
+            need_to_analyse = False if self._neighbours_array_use_fractional_borders_ == use_fractional_borders else True
+        else:
+            need_to_analyse = True
+        
+        if need_to_analyse:
+            self._neighbours_array_ = _make_neighbours_array_(self, use_fractional_borders)
+            self._neighbours_array_use_fractional_borders_ = use_fractional_borders
+            
+        return self._neighbours_array_
+    
+    
+    def coastline_array(self):        
+        if '_coastline_array_' not in dir(self):
+            self._coastline_array_ = _make_coastline_array_(self)        
+        return self._coastline_array_
+    
+    
+    def distance_array(self):        
+        if '_distance_array_' not in dir(self):
+            self._distance_array_ = _make_distance_array_(self)            
+        return self._distance_array_
+    
+    
+    def orientation_arrays(self):
+        if '_orientation_arrays_' not in dir(self):
+            self._orientation_arrays_ = _make_orientation_arrays_(self)
+        return self._orientation_arrays_
+    
+    
+    
 def _homogenise_gdf_(
     geodataframe,
     id_header,
@@ -90,7 +152,8 @@ def _turn_df_into_matrix_(
 
 def _make_neighbours_array_(
     inf, # Must be class Input_File
-    use_fractional_borders
+    use_fractional_borders,
+    only_non_coastal=True
 ):
     # Generates a 2D matrix of weights, where the weights are equal to the fraction of column geometry's
     # border which is shared with row geometry.
@@ -113,6 +176,21 @@ def _make_neighbours_array_(
             lambda row: row['intersection'].length/row['geocopy_left'].length,
             axis=1
         )
+        
+        if only_non_coastal:
+            neighbours['weight'] = neighbours.apply(
+                lambda row: (
+                    row['weight']/(
+                        1-inf.coastline_array()[
+                            inf.lookups.id_to_ix(
+                                row[inf.id_header+'_left']
+                            )
+                        ]
+                    )
+                ),
+                axis=1
+            )
+                
 
     else:
         neighbours['weight'] = neighbours.apply(lambda row: 1.0, axis=1)
@@ -129,12 +207,10 @@ def _make_neighbours_array_(
 def _make_coastline_array_(
     inf
 ):
-    # Generates a 1D vector of weights, where the weights are equal to the geometry's coast as a
-    # fraction of its perimeter
-    
-    coastline_vector = 1-np.sum(inf.neighbours_array(use_fractional_borders=True), axis=1)
-    coastline_vector[coastline_vector<0.01] = 0 # To allow for rounding errors
-    return coastline_vector
+    coastline_lengths = inf.geodata.intersection(inf.coastline).length.values
+    return coastline_lengths/inf.geodata.length.values
+
+
 
 def _make_distance_array_(
     inf
@@ -168,5 +244,14 @@ def _make_distance_array_(
         inf.number_of_geographies,
         inf.lookups
     )
+
+
+def _make_orientation_arrays_(
+    inf
+):
     
-    
+    x_vals = inf.geodata['__centroid__'].apply(lambda c: c.xy[0][0]).values
+    y_vals = inf.geodata['__centroid__'].apply(lambda c: c.xy[1][0]).values
+    ew_ranks = rankdata(x_vals)-1
+    ns_ranks = rankdata(y_vals)-1
+    return (ns_ranks, ew_ranks)
